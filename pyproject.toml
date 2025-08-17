@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=45", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "query_score"
+authors= [{name = "Bruno Paris"}]
+description = ""
+requires-python = ">=3.9,<3.13"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "click",
+  "einops",
+  "tqdm",
+]
+dynamic = ["version"]
+
+[project.readme]
+file="README.md"
+content-type = "text/markdown"
+
+[tool.setuptools.packages.find]
+include = ["vit_query_score*"]
+
