@@ -14,8 +14,77 @@ from mmcv.cnn.bricks.transformer import FFN, PatchEmbed
 from mmengine.registry import MODELS
 from mmengine.model import BaseModule, ModuleList
 from mmengine.runner import load_checkpoint
+from mmengine.model.weight_init import constant_init, trunc_normal_init
 
 from vit_query_score.utils import ConfigType, OptConfigType, get_sinusoid_encoding
+
+
+class Adapter(BaseModule):
+    def __init__(
+        self,
+        embed_dims: int,
+        mlp_ratio: float = 0.25,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        temporal_size: int = 384,
+    ) -> None:
+        super().__init__()
+        print(f"TEMPORAL SIZE: {temporal_size}")
+
+        hidden_dims = int(embed_dims * mlp_ratio)
+
+        # temporal depth-wise convolution
+        self.temporal_size = temporal_size
+        self.dwconv = nn.Conv1d(
+            hidden_dims,
+            hidden_dims,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=(kernel_size // 2) * dilation,
+            dilation=dilation,
+            groups=hidden_dims,
+        )
+        self.conv = nn.Conv1d(hidden_dims, hidden_dims, 1)
+        self.dwconv.weight.data.normal_(mean=0.0, std=math.sqrt(2.0 / kernel_size))
+        self.dwconv.bias.data.zero_()
+        self.conv.weight.data.normal_(mean=0.0, std=math.sqrt(2.0 / hidden_dims))
+        self.conv.bias.data.zero_()
+        # adapter projection
+        self.down_proj = nn.Linear(embed_dims, hidden_dims)
+        self.act = nn.GELU()
+        self.up_proj = nn.Linear(hidden_dims, embed_dims)
+        self.gamma = nn.Parameter(torch.ones(1))
+        trunc_normal_init(self.down_proj, std=0.02, bias=0)
+        constant_init(self.up_proj, 0)  # the last projection layer is initialized to 0
+
+    def forward(self, x: Tensor, h: int, w: int) -> Tensor:
+        print(f"x shape in adapter: {x.shape}")
+        print(f"h, w in adapter: {h}, {w}")
+        inputs = x
+
+        # down and up projection
+        x = self.down_proj(x)
+        x = self.act(x)
+        print(f" -> x: {x.shape}")
+
+        # temporal depth-wise convolution
+        B, N, C = x.shape  # 48, 8*10*10, 384
+        attn = x.reshape(
+            -1, self.temporal_size, h, w, x.shape[-1]
+        )  # [b,t,h,w,c]  [1,384,10,10,384]
+        attn = attn.permute(0, 2, 3, 4, 1).flatten(
+            0, 2
+        )  # [b*h*w,c,t] [1*10*10,384,384]
+        attn = self.dwconv(attn)  # [b*h*w,c,t] [1*10*10,384,384]
+        attn = self.conv(attn)  # [b*h*w,c,t] [1*10*10,384,384]
+        attn = attn.unflatten(0, (-1, h, w)).permute(
+            0, 4, 1, 2, 3
+        )  # [b,t,h,w,c] [1,384,10,10,384]
+        attn = attn.reshape(B, N, C)
+        x = x + attn
+
+        x = self.up_proj(x)
+        return x * self.gamma + inputs
 
 
 def _compute_query_score(q: torch.Tensor, k: torch.Tensor) -> Tensor:
@@ -182,6 +251,8 @@ class Block(BaseModule):
         norm_cfg: ConfigType = dict(type="LN", eps=1e-6),
         init_cfg: OptConfigType = None,
         with_cp: bool = False,
+        adapter_mlp_ratio: float = 0.25,
+        temporal_size: int = 384,
         **kwargs,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
@@ -211,8 +282,16 @@ class Block(BaseModule):
             add_identity=False,
         )
 
+        self.adapter = Adapter(
+            embed_dims=embed_dims,
+            kernel_size=3,
+            dilation=1,
+            temporal_size=temporal_size,
+            mlp_ratio=adapter_mlp_ratio,
+        )
+
     def forward(
-        self, x: Tensor, need_query_score: bool = False
+        self, x: Tensor, h, w, need_query_score: bool = False
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Defines the computation performed at every call.
 
@@ -227,11 +306,13 @@ class Block(BaseModule):
         x = x + self.drop_path(x_attn)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
+        x = self.adapter(x, h, w)
+
         return x, query_score
 
 
 @MODELS.register_module()
-class VisionTransformer(BaseModule):
+class ViTAdapter(BaseModule):
     """Vision Transformer with support for patch or hybrid CNN input stage. An
     impl of `VideoMAE: Masked Autoencoders are Data-Efficient Learners for
     Self-Supervised Video Pre-Training <https://arxiv.org/pdf/2203.12602.pdf>`_
@@ -297,6 +378,8 @@ class VisionTransformer(BaseModule):
         pretrained: Optional[str] = None,
         return_feat_map: bool = False,
         with_cp: bool = False,
+        adapter_mlp_ratio: float = 0.25,
+        total_frames: int = 768,
         frozen_layers: int = -1,
         init_cfg: Optional[Union[Dict, List[Dict]]] = [
             dict(type="TruncNormal", layer="Linear", std=0.02, bias=0.0),
@@ -351,6 +434,8 @@ class VisionTransformer(BaseModule):
                     drop_path_rate=dpr[i],
                     norm_cfg=norm_cfg,
                     with_cp=with_cp,
+                    adapter_mlp_ratio=adapter_mlp_ratio,
+                    temporal_size=total_frames // tubelet_size,
                 )
                 for i in range(depth)
             ]
@@ -400,7 +485,7 @@ class VisionTransformer(BaseModule):
         query_score = None
         for idx, blk in enumerate(self.blocks):
             need_query_score = idx == query_score_block_idx
-            x, aux_query_score = blk(x, need_query_score)
+            x, aux_query_score = blk(x, h, w, need_query_score)
 
             if aux_query_score is not None:
                 query_score = aux_query_score
@@ -425,54 +510,5 @@ class VisionTransformer(BaseModule):
 
         x = x.mean(dim=1)
         x = self.norm(x)
-
-        return x, query_score
-
-
-@MODELS.register_module()
-class ClassificationHead(BaseModule):
-    def __init__(
-        self,
-        num_classes: int,
-        in_channels: int,
-        act_func: Callable[[torch.Tensor], torch.Tensor] = lambda x: x.softmax(dim=-1),
-    ) -> None:
-        super().__init__()
-        self.num_classes = num_classes
-        self.in_channels = in_channels
-        self.fc_cls = nn.Linear(in_channels, num_classes)
-        self.act_func = act_func
-
-    def forward(self, x: Tensor) -> Tensor:
-
-        print(f"x: {x.shape}")
-        x = self.fc_cls(x)
-        x = self.act_func(x)
-        return x
-
-
-@MODELS.register_module()
-class VitWrapper(BaseModule):
-
-    def __init__(self, backbone, cls_head=None) -> None:
-        super().__init__()
-        self.backbone = MODELS.build(backbone)
-
-        self.cls_head = MODELS.build(cls_head) if cls_head is not None else nn.Identity()
-
-    def forward(
-        self, x: Tensor, query_score_block_idx: int
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-        """Defines the computation performed at every call.
-
-        Args:
-            x (Tensor): The input data.
-        Returns:
-            Tensor: The feature of the input
-                samples extracted by the backbone.
-        """
-        x, query_score = self.backbone(x, query_score_block_idx)
-
-        x = self.cls_head(x)
 
         return x, query_score

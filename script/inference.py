@@ -11,6 +11,9 @@ from mmengine.registry import MODELS
 
 # import to trigger model registration
 import vit_query_score.vit
+import vit_query_score.vit_adapter
+
+from vit_query_score.encoding import reencode_and_replace
 
 
 def write_query_scores(video_fp, array_query_score, H, W, output_path):
@@ -136,6 +139,7 @@ def main(config_fp: str, weights_fp: str, video_fp: str, output_dir: str):
 
     cfg = Config.fromfile(config_fp)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"DEVICE: {device}")
 
     cap = cv2.VideoCapture(video_fp)
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -146,7 +150,15 @@ def main(config_fp: str, weights_fp: str, video_fp: str, output_dir: str):
 
     # Load weights
     state_dict = torch.load(weights_fp, map_location=device)
-    model.load_state_dict(state_dict)
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+
+    # remove all  prefix before the last backbone in state_dict keys
+    state_dict = {
+        "backbone." + k.split("backbone.")[-1]: v for k, v in state_dict.items()
+    }
+
+    model.load_state_dict(state_dict, strict=False)
 
     list_query_score = []
     for i, chunk_frames in tqdm(
@@ -173,6 +185,15 @@ def main(config_fp: str, weights_fp: str, video_fp: str, output_dir: str):
 
     output_path = Path(output_dir) / f"{video_name}_query_scores.mp4"
     write_query_scores(video_fp, array_query_score, H, W, output_path)
+
+    tmp_dir = Path("/tmp/vit_query_score")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    reencode_and_replace(
+        tmp_dir=tmp_dir,
+        video_fp=output_path,
+        hwaccel=True,
+    )
 
 
 if __name__ == "__main__":
