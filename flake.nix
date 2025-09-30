@@ -35,6 +35,8 @@
           python312Packages.mmengine
           python312Packages.mmcv
           python312Packages.torch-bin
+          python312Packages.torchvision-bin
+          python312Packages.av
         ];
 
 

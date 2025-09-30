@@ -1,12 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Dict, List, Optional, Union, Tuple, Callable
 
+import cv2
 import math
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 from torch import Tensor, nn
 import einops
+import matplotlib.pyplot as plt
 
 from mmcv.cnn import build_norm_layer
 from mmcv.cnn.bricks import DropPath
@@ -43,7 +45,7 @@ def _compute_query_score(q: torch.Tensor, k: torch.Tensor) -> Tensor:
     query_score = attn.mean(dim=-2).mean(dim=1)
 
     # normalize the query score
-    query_score = F.normalize(query_score, p=1.0, dim=-1)
+    # query_score = F.normalize(query_score, p=1.0, dim=-1)
 
     return query_score
 
@@ -131,6 +133,18 @@ class Attention(BaseModule):
         # attn = q @ k.transpose(-2, -1)
         # attn = attn.softmax(dim=-1)
         # attn = self.attn_drop(attn)
+        # print(f"attn: {attn.shape}")
+        # # # write attn as image for debugging  in dump
+        # # # take first attn of the batch and first head
+        # array_attn = attn[0, 0].detach().cpu().numpy()
+        # min_array_attn = array_attn.min()
+        # max_array_attn = array_attn.max()
+        # # # Normalize to 0-255
+        # array_attn = (array_attn - min_array_attn) / (max_array_attn - min_array_attn)
+        # array_attn = (array_attn * 255).astype('uint8')
+
+        # print(f"  -> array_attn: {array_attn.shape}")
+        # cv2.imwrite("dump/attn.png", array_attn * 255)
         # x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
 
         # fast attention
@@ -407,7 +421,10 @@ class VisionTransformer(BaseModule):
                 B, Ntoken = query_score.shape
                 Nframes = Ntoken // (h * w)
 
-                temperature = 0.005
+                # set last token query score at 0 (class token)
+                query_score[:, -1] = 0
+
+                temperature = 0.0005
                 query_score = (query_score / temperature).softmax(dim=-1)
 
                 query_score = einops.rearrange(
@@ -423,10 +440,22 @@ class VisionTransformer(BaseModule):
                     query_score, "b (h w) f -> b f h w", h=h, w=w
                 )
 
-        x = x.mean(dim=1)
+        # x = x.mean(dim=1)
+        # x = self.norm(x)
+        # return x, query_score
+
+        # From vit.py in OpenTAD github repos
         x = self.norm(x)
 
-        return x, query_score
+        if self.return_feat_map:
+            x = x.reshape(b, -1, h, w, self.embed_dims)
+            x = x.permute(0, 4, 1, 2, 3)
+            return x, query_score
+
+        if self.fc_norm is not None:
+            return self.fc_norm(x.mean(1)), query_score
+
+        return x[:, 0], query_score
 
 
 @MODELS.register_module()
@@ -458,7 +487,9 @@ class VitWrapper(BaseModule):
         super().__init__()
         self.backbone = MODELS.build(backbone)
 
-        self.cls_head = MODELS.build(cls_head) if cls_head is not None else nn.Identity()
+        self.cls_head = (
+            MODELS.build(cls_head) if cls_head is not None else nn.Identity()
+        )
 
     def forward(
         self, x: Tensor, query_score_block_idx: int
