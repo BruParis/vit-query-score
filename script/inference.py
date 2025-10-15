@@ -47,8 +47,9 @@ def write_query_scores(
         if not ret:
             break
 
-        if frame_idx >= len(array_query_score):
-            break
+        #if frame_idx >= len(array_query_score):
+        #    print(f"frame_idx {frame_idx} >= len(array_query_score) {len(array_query_score)}")
+        #    break
 
         if frame_idx not in set_frame_idx:
             out.write(frame)
@@ -59,7 +60,7 @@ def write_query_scores(
         # Get the query scores for this frame
         query_scores = array_query_score[frame_idx]
         # make 1 - exp(-8 * score) to enhance the contrast
-        qs_color = 1 - np.exp(-8 * query_scores)
+        qs_color = 1 - np.exp(-30 * query_scores)
         qs_color_255 = (qs_color * 255).astype(np.uint8)
 
         query_score_resize = cv2.resize(
@@ -124,7 +125,7 @@ def write_query_scores(
     out.release()
 
 
-def generate_frame_tensors(cap, chunk_size=16, target_size=(160, 160)):
+def generate_frame_tensors(cap, chunk_size=16, target_size=(160, 160), stride=4):
     frames = []
     frames_indices = []
 
@@ -133,6 +134,11 @@ def generate_frame_tensors(cap, chunk_size=16, target_size=(160, 160)):
         ret, frame = cap.read()
         if not ret:
             break
+
+        if fr_idx % stride != 0:
+            frames_indices.append(fr_idx)
+            fr_idx += 1
+            continue
 
         # Convert BGR to RGB
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -204,8 +210,14 @@ def generate_frame_tensors(cap, chunk_size=16, target_size=(160, 160)):
 @click.option(
     "--threshold", "-t", type=float, default=0.7, help="Threshold for class logits."
 )
+@click.option("--stride", "-s", type=int, default=4, help="Frame stride.")
 def main(
-    config_fp: str, weights_fp: str, video_fp: str, output_dir: str, threshold: float
+    config_fp: str,
+    weights_fp: str,
+    video_fp: str,
+    output_dir: str,
+    threshold: float,
+    stride: int,
 ):
 
     video_name = Path(video_fp).stem
@@ -251,12 +263,18 @@ def main(
     # print(
     #     "   --> attn qkv", model.state_dict()["backbone.blocks.0.attn.qkv.weight"][:5]
     # )
+    chunk_size = 16
+    # num chunk taking stride into account
+    num_chunks = (num_frames + stride - 1) // stride // chunk_size
 
     list_query_score = []
     set_frame_idx: Set[int] = set()
-    for i, (chunk_fr_idx, chunk_frames) in tqdm(
-        enumerate(generate_frame_tensors(cap, chunk_size=16, target_size=(224, 224))),
-        total=num_frames // 16,
+    frame_generator = generate_frame_tensors(
+        cap, chunk_size=16, target_size=(224, 224), stride=stride
+    )
+    for chunk_fr_idx, chunk_frames in tqdm(
+        frame_generator,
+        total=num_chunks,
         desc="Processing frames",
     ):
         with torch.inference_mode():
@@ -266,13 +284,14 @@ def main(
             max_logits, max_indices = cls_logits.max(dim=1)
             print(f"max_logits: {max_logits} - max_indices: {max_indices}")
 
+        query_score = einops.repeat(query_score, "b f h w -> b (f s) h w", s=stride)
         query_score = einops.rearrange(query_score, "b f h w -> (b f) h w")
         query_score = query_score.cpu().numpy()
         list_query_score.append(query_score)
 
         if max_logits.item() >= threshold:
             print(
-                f"Chunk {i}: max logits {max_logits.item():.3f} >= threshold {threshold}"
+                f" -> max logits {max_logits.item():.3f} >= threshold {threshold}"
             )
             set_frame_idx.update(chunk_fr_idx)
 

@@ -20,7 +20,7 @@ from mmengine.runner import load_checkpoint
 from vit_query_score.utils import ConfigType, OptConfigType, get_sinusoid_encoding
 
 
-def _compute_query_score(q: torch.Tensor, k: torch.Tensor) -> Tensor:
+def _compute_query_score(q: torch.Tensor, k: torch.Tensor, scale: float) -> Tensor:
     """
     Compute the query score in the self-attention mechanism.
     Args:
@@ -31,9 +31,13 @@ def _compute_query_score(q: torch.Tensor, k: torch.Tensor) -> Tensor:
     """
 
     # Scale factor used in scaled dot-product attention implementation
-    scale_factor = 1 / math.sqrt(q.size(-1))
+    # scale_factor = 1 / math.sqrt(q.size(-1))
+    q = q * scale
 
-    q = q * scale_factor
+    # set the class token to zero
+    q[..., -1] = 0
+    k[..., -1] = 0
+
     attn = q @ k.transpose(-2, -1)
 
     # [B, H, N (query), N (key)]
@@ -45,7 +49,7 @@ def _compute_query_score(q: torch.Tensor, k: torch.Tensor) -> Tensor:
     query_score = attn.mean(dim=-2).mean(dim=1)
 
     # normalize the query score
-    # query_score = F.normalize(query_score, p=1.0, dim=-1)
+    query_score = F.normalize(query_score, p=1.0, dim=-1)
 
     return query_score
 
@@ -124,7 +128,7 @@ class Attention(BaseModule):
             q0 = q.clone().detach()
             k0 = k.clone().detach()
 
-            query_score = _compute_query_score(q0, k0)
+            query_score = _compute_query_score(q0, k0, self.scale)
         else:
             query_score = None
 
@@ -421,11 +425,30 @@ class VisionTransformer(BaseModule):
                 B, Ntoken = query_score.shape
                 Nframes = Ntoken // (h * w)
 
+                # ===================================================
                 # set last token query score at 0 (class token)
-                query_score[:, -1] = 0
+                # and the corresponding patches in other frames
+                # (probably similar to padding token)
+                # query_score = einops.rearrange(
+                #     query_score, "b (f h w) -> b f h w", f=Nframes, h=h, w=w
+                # )
+                # query_score[..., -1, -1] = 0
+                # query_score = einops.rearrange(query_score, "b f h w -> b (f h w)")
+                # ===================================================
 
-                temperature = 0.0005
+                # ===================================================
+                # Softmax per frame
+                query_score = einops.rearrange(
+                    query_score, "b (f ftoken) -> b f ftoken", f=Nframes
+                )
+
+                temperature = 0.005
                 query_score = (query_score / temperature).softmax(dim=-1)
+
+                query_score = einops.rearrange(
+                    query_score, "b f ftoken -> b (f ftoken)", f=Nframes
+                )
+                # ===================================================
 
                 query_score = einops.rearrange(
                     query_score, "b (f ftoken) -> b ftoken f", f=Nframes

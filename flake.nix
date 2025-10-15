@@ -22,27 +22,43 @@
       pkgs = import nixpkgs {
         inherit system;
         config.allowUnfree = true;
+        config.allowBroken = true;
       };
     in
     {
       devShells.${system}.default = pkgs.mkShell {
         buildInputs = with pkgs; [
 
-          ffmpeg-full
-          python312
-          python312Packages.pip
-          python312Packages.numpy
-          python312Packages.mmengine
-          python312Packages.mmcv
-          python312Packages.torch-bin
-          python312Packages.torchvision-bin
-          python312Packages.av
-        ];
+          cudatoolkit_11 # CUDA 11.8
 
+          ffmpeg-full
+          python310
+          python310Packages.pip
+          # install in virtual env to get the specific version
+          # compatible with the pytorch with adequate compute capability
+          # python310Packages.numpy
+          python310Packages.av
+
+          stdenv.cc.cc.lib # required by numpy
+          zlib
+          glib # required by opencv-python: glib and glib.out
+
+          # install in virtualenv
+          # -> nix will install pytorch for a specific CUDA version which 
+          # does not necessarily have the compute capability required by the device
+          # python310Packages.mmengine
+          # python310Packages.mmcv
+          # python310Packages.torch-bin
+          # python310Packages.torchvision-bin
+        ];
 
         shellHook = ''
           echo "You are now using a NIX environment"
-          export CUDA_PATH=${pkgs.cudatoolkit}
+          export CUDA_PATH=${pkgs.cudatoolkit_11}
+          export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:${pkgs.zlib}/lib:${pkgs.libGL}/lib:${pkgs.glib}/lib:${pkgs.glib.out}/lib:$LD_LIBRARY_PATH"
+  	  # Add host NVIDIA libraries
+  	  export LD_LIBRARY_PATH="/run/opengl-driver/lib:/run/opengl-driver-32/lib:$LD_LIBRARY_PATH"
+  	  export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
         '';
       };
     };
